@@ -1,0 +1,6 @@
+streamlit>=1.38
+anthropic>=0.40
+scikit-learn>=1.5
+pytesseract>=0.3.13
+Pillow>=10.0
+pytest>=8.0

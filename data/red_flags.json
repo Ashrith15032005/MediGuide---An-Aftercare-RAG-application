@@ -1,0 +1,19 @@
+{
+  "description": "Generic symptom/complication keyword patterns (regex, case-insensitive). If a patient query matches any of these, the safety layer refuses to answer and redirects to a doctor instead of using the RAG pipeline.",
+  "patterns": [
+    "\\bfever\\b", "\\btemperature\\b",
+    "\\bbleed(ing)?\\b", "\\bblood\\b",
+    "\\bpus\\b", "\\bdischarge\\b",
+    "\\bswoll?en\\b", "\\bswelling\\b",
+    "\\bred(ness)?\\b",
+    "\\bsevere pain\\b", "\\bworsening pain\\b", "\\bunbearable\\b",
+    "\\bvomit(ing)?\\b", "\\bnausea\\b",
+    "\\bfaint(ed|ing)?\\b", "\\bdizz(y|iness)\\b",
+    "\\bchest pain\\b", "\\bdifficulty breathing\\b", "\\bshortness of breath\\b",
+    "\\bconfus(ed|ion)\\b",
+    "\\bnot healing\\b", "\\bwound.{0,15}(open|smell|leak)",
+    "\\binfection\\b",
+    "\\bemergency\\b", "\\burgent\\b"
+  ],
+  "refusal_message": "This sounds like it may need medical attention. Please contact your doctor or hospital directly, or go to the nearest emergency room if it feels urgent. I'm not able to assess symptoms — I can only help with general diet, activity, sleep, and care questions."
+}
