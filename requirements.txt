@@ -1,6 +1,20 @@
+# LangChain (modular packages)
+langchain-core>=0.3
+langchain-text-splitters>=0.3
+langchain-chroma>=0.2
+langchain-google-genai>=2.1
+chromadb>=0.5
+
+# UI and utilities
 streamlit>=1.38
-anthropic>=0.40
-scikit-learn>=1.5
+python-dotenv>=1.0
+pandas>=2.0
+
+# Prescription scanning (images and PDFs)
 pytesseract>=0.3.13
 Pillow>=10.0
+pypdf>=4.0
+pypdfium2>=4.30
+
+# Tests
 pytest>=8.0

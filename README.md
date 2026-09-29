@@ -1,94 +1,102 @@
-# MediGuide (Beta)
+# MediGuide
 
-A Retrieval-Augmented Generation (RAG) based post-discharge patient care assistant.
+A grounded, safety-first post-discharge patient care assistant built with LangChain LCEL, ChromaDB, and Google Gemini.
+
+---
 
 ## Project Structure
 
 ```
 mediguide/
 ├── app/
-│   └── streamlit_app.py      # Demo UI
+│   └── streamlit_app.py      # Streamlit web application
 ├── data/
-│   ├── knowledge_base/       # Curated aftercare docs (one .md per procedure)
-│   └── red_flags.json        # Safety layer keyword patterns
+│   ├── knowledge_base/       # Curated aftercare guidelines (.md per procedure)
+│   ├── red_flags.json        # Rule-based safety gate keywords & vital sign thresholds
+│   └── patients/             # Patient profile JSON store (git-ignored)
+├── docs/
+│   └── ARCHITECTURE.md       # Architecture details, viva preparation & report outline
+├── eval/
+│   ├── eval_set.json         # Evaluation queries (safety + retrieval ground truth)
+│   └── evaluate.py           # Safety accuracy & retrieval hit-rate evaluation harness
 ├── src/
-│   ├── config.py             # Paths, model settings, prompts
-│   ├── ingest.py             # Builds the TF-IDF retrieval index
-│   ├── rag_chain.py          # Retrieval + generation orchestrator
-│   ├── safety.py             # Rule-based refusal layer
-│   ├── patient_history.py    # Per-patient session context
-│   ├── prescription_ocr.py   # Prescription scan (OCR + parsing)
-│   └── text_utils.py         # Shared stemmer/tokenizer
-├── tests/
-│   └── test_safety.py
-├── main.py                   # CLI entry point
+│   ├── config.py             # Central settings & configuration
+│   ├── ingest.py             # Knowledge base chunking & ChromaDB vectorstore ingestion
+│   ├── knowledge_base.py     # Two-stage split (Markdown headers + recursive character)
+│   ├── patient.py            # Patient profile, intake, and local persistence
+│   ├── prescriptions.py      # Prescription OCR & PDF text parser
+│   ├── procedures.py         # Procedure registry & typo-tolerant phrase matcher
+│   ├── rag_chain.py          # LangChain Expression Language (LCEL) RAG pipeline
+│   └── safety.py             # Deterministic 4-level safety gate (emergency, urgent, refer, ok)
+├── tests/                    # Comprehensive unit & integration test suite (115 passing tests)
+├── main.py                   # CLI interface
 └── requirements.txt
 ```
 
-## Setup
+---
+
+## Quickstart
+
+### 1. Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Tesseract OCR is required for the prescription scan feature:
-- Mac: `brew install tesseract`
-- Ubuntu/Debian: `sudo apt install tesseract-ocr`
-- Windows: https://github.com/UB-Mannheim/tesseract/wiki
+> **Optional OCR dependency**: Tesseract is recommended for scanning image-based prescriptions:
+> - macOS: `brew install tesseract`
+> - Ubuntu/Debian: `sudo apt-get install tesseract-ocr`
 
-Set your Anthropic API key for live answers (optional — dry-run mode works without it):
+### 2. Environment Setup
+
+Configure your Google Gemini API key:
 ```bash
-export ANTHROPIC_API_KEY=your_key_here
+export GOOGLE_API_KEY="your_api_key_here"
+```
+Or create a `.env` file in the project root:
+```ini
+GOOGLE_API_KEY=your_api_key_here
 ```
 
-## Build the retrieval index
+### 3. Ingest Knowledge Base
 
-Run once, and again whenever you edit `data/knowledge_base/*.md`:
+Build the ChromaDB vector database from curated aftercare documentation:
 ```bash
 python -m src.ingest
 ```
 
-## Run
+### 4. Running the Application
+
+#### Streamlit Web App
+```bash
+streamlit run app/streamlit_app.py
+```
+
+#### CLI Interface
+```bash
+# List supported procedures
+python main.py --list
+
+# Single question
+python main.py --procedure appendectomy --query "can I eat rice?"
+
+# Natural language procedure description
+python main.py --describe "I had my appendix removed" --query "can I take a shower?"
+
+# Interactive chat
+python main.py --procedure c_section
+```
+
+### 5. Running Tests & Evaluation
 
 ```bash
-# CLI
-python main.py --procedure appendectomy --query "can I eat rice?"
-python main.py --procedure appendectomy --query "can I eat rice?" --no-llm   # no API key needed
+# Run full test suite
+pytest -v
 
-# Streamlit app
-streamlit run app/streamlit_app.py
+# Run safety layer evaluation (offline, zero-cost)
+python -m eval.evaluate
 
-# Tests
-pytest tests/ -v
+# Run retrieval evaluation & threshold sweep (requires built vectorstore)
+python -m eval.evaluate --retrieval --threshold-sweep
 ```
 
-## Architecture
-
-```
-Patient selects procedure -> asks a question
-        |
-        v
-   Safety Layer (rule-based symptom detection, data/red_flags.json)
-    |                          |
- refuse                    proceed
-    |                          v
-    |                 Retrieval (TF-IDF + stemming, procedure-scoped)
-    |                          v
-    |                 Patient History + Prescription context
-    |                          v
-    |                 LLM generation (grounded, must cite section)
-    |                          v
-    +------------------> Answer shown to patient (with sources)
-```
-
-## Known Limitations (Beta) / Future Work
-
-- Retrieval uses TF-IDF, not neural embeddings — swap in `sentence-transformers` or an API embedding model for semantic search
-- Prescription OCR uses heuristic line parsing — works best on printed prescriptions; handwriting is noisy
-- No multilingual support yet
-- Patient history is single-session, file-based — needs a real database + auth for multi-user deployment
-- Safety layer is keyword-based — a trained classifier would catch more nuanced symptom phrasing
-
-## Evaluation (Recommended Next Step)
-
-Build a test set of ~20-30 questions per procedure with known-correct answers, and measure retrieval accuracy, answer correctness, and refusal accuracy.

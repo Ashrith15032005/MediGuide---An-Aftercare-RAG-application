@@ -1,85 +1,70 @@
 """
-Ingestion Pipeline
-------------------
-Reads each procedure's markdown knowledge base file, chunks it by ## section,
-and builds a TF-IDF retrieval index (data/index.pkl).
+ingest.py - build the vector store.
 
-Run this once, and again any time you edit files in data/knowledge_base/:
-    python -m src.ingest
+    python -m src.ingest             # embed chunks and store them in ChromaDB
+    python -m src.ingest --dry-run   # only show the chunks (no API key needed)
+
+What happens: chunks (see knowledge_base.py) are turned into embeddings by
+Gemini and stored in ChromaDB on disk. An EMBEDDING is a list of numbers that
+represents the meaning of a text; texts with similar meaning have vectors that
+point in similar directions, which is how retrieval finds relevant passages.
+
+Re-run this whenever you edit a file in data/knowledge_base/.
 """
+from __future__ import annotations
 
-import os
-import re
-import pickle
-from dataclasses import dataclass, asdict
-from sklearn.feature_extraction.text import TfidfVectorizer
+import argparse
+import shutil
+from collections import Counter
 
-from src import config
-from src.text_utils import tokenize_and_stem, STEMMED_STOP_WORDS
-
-
-@dataclass
-class Chunk:
-    chunk_id: str
-    procedure: str
-    section: str
-    text: str
+from src.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, require_api_key
+from src.knowledge_base import load_chunks
 
 
-def chunk_markdown(filepath: str, procedure: str):
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    parts = re.split(r"\n(?=## )", content)
-    chunks = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if part.startswith("# ") and "\n## " not in part:
-            continue  # skip a title-only fragment
-        header_match = re.match(r"##\s+(.+)", part)
-        section = header_match.group(1).strip() if header_match else "Overview"
-        chunks.append(Chunk(
-            chunk_id=f"{procedure}::{section}",
-            procedure=procedure,
-            section=section,
-            text=part,
-        ))
-    return chunks
+def get_embeddings():
+    """Gemini embedding model through LangChain."""
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    require_api_key()
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 
 
-def build_index():
-    all_chunks = []
-    for fname in sorted(os.listdir(config.KB_DIR)):
-        if not fname.endswith(".md"):
-            continue
-        procedure = fname.replace(".md", "")
-        chunks = chunk_markdown(os.path.join(config.KB_DIR, fname), procedure)
-        all_chunks.extend(chunks)
-
-    texts = [c.text for c in all_chunks]
-    vectorizer = TfidfVectorizer(
-        tokenizer=tokenize_and_stem,
-        token_pattern=None,
-        stop_words=STEMMED_STOP_WORDS,
-        ngram_range=(1, 2),
+def get_vectorstore(embeddings=None):
+    """Open the persisted Chroma collection (cosine distance)."""
+    from langchain_chroma import Chroma
+    return Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings or get_embeddings(),
+        persist_directory=str(CHROMA_DIR),
+        collection_metadata={"hnsw:space": "cosine"},
     )
-    matrix = vectorizer.fit_transform(texts)
 
-    os.makedirs(os.path.dirname(config.INDEX_PATH), exist_ok=True)
-    with open(config.INDEX_PATH, "wb") as f:
-        pickle.dump({
-            "chunks": [asdict(c) for c in all_chunks],
-            "vectorizer": vectorizer,
-            "matrix": matrix,
-        }, f)
 
-    print(f"Indexed {len(all_chunks)} chunks from "
-          f"{len(set(c.procedure for c in all_chunks))} procedures.")
-    for c in all_chunks:
-        print(f"  - [{c.procedure}] {c.section}")
+def build_index(reset: bool = True) -> int:
+    chunks = load_chunks()
+    if reset and CHROMA_DIR.exists():
+        shutil.rmtree(CHROMA_DIR)
+    store = get_vectorstore()
+    ids = [f"{c.metadata['procedure']}-{i}" for i, c in enumerate(chunks)]
+    store.add_documents(chunks, ids=ids)
+    return len(chunks)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build the MediGuide vector store")
+    parser.add_argument("--dry-run", action="store_true", help="show chunks only")
+    args = parser.parse_args()
+
+    chunks = load_chunks()
+    counts = Counter((c.metadata["procedure"], c.metadata["kind"]) for c in chunks)
+    print(f"{len(chunks)} chunks prepared")
+    for (proc, kind), n in sorted(counts.items()):
+        print(f"  {proc:24s} {kind:9s} {n}")
+    if args.dry_run:
+        print("\nSample chunk:\n" + chunks[0].page_content[:400])
+        return
+    n = build_index()
+    print(f"Indexed {n} chunks into {CHROMA_DIR}")
 
 
 if __name__ == "__main__":
-    build_index()
+    main()

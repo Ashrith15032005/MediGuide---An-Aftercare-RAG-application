@@ -19,11 +19,19 @@ env/
 .coverage
 htmlcov/
 
-# Generated / large binary files — rebuild with: python3 -m src.ingest
+# Generated / vector database — rebuild with: python3 -m src.ingest
 data/index.pkl
+data/chroma_db/
 
-# Patient session data (contains PII)
+# Patient data (contains PII)
 data/sessions/
+data/patients/
+
+# Environment secrets
+.env
+.env.*
+*.env
+**/.env
 
 # Temporary prescription uploads
 /tmp/
@@ -35,3 +43,4 @@ data/sessions/
 .vscode/
 .idea/
 *.swp
+

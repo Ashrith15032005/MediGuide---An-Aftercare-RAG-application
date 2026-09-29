@@ -1,42 +1,62 @@
 """
-Central configuration for MediGuide.
-All paths are resolved relative to the project root so the app works
-regardless of which directory you run it from.
+config.py - central settings for MediGuide.
+
+Every tunable value lives here so the rest of the code has no "magic
+numbers". Values can be overridden with environment variables (or a .env
+file), which is the standard way to keep secrets such as API keys out of
+source code.
 """
+from __future__ import annotations
 
 import os
+from pathlib import Path
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv
 
-KB_DIR = os.path.join(ROOT_DIR, "data", "knowledge_base")
-RED_FLAGS_PATH = os.path.join(ROOT_DIR, "data", "red_flags.json")
-INDEX_PATH = os.path.join(ROOT_DIR, "data", "index.pkl")
-SESSIONS_DIR = os.path.join(ROOT_DIR, "data", "sessions")
+# Load variables from a .env file in the project root (if present).
+ROOT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT_DIR / ".env")
 
-os.makedirs(SESSIONS_DIR, exist_ok=True)
+# ---- Paths -----------------------------------------------------------------
+DATA_DIR = ROOT_DIR / "data"
+KB_DIR = DATA_DIR / "knowledge_base"
+RED_FLAGS_PATH = DATA_DIR / "red_flags.json"
+CHROMA_DIR = DATA_DIR / "chroma_db"
+PATIENT_DIR = DATA_DIR / "patients"
+COLLECTION_NAME = "mediguide_kb"
 
-# LLM settings
-LLM_MODEL = "claude-sonnet-4-6"
-LLM_MAX_TOKENS = 500
+# ---- Models ----------------------------------------------------------------
+# langchain-google-genai reads GOOGLE_API_KEY from the environment itself.
+LLM_MODEL = os.getenv("MEDIGUIDE_LLM_MODEL", "gemini-2.5-flash")
+EMBEDDING_MODEL = os.getenv("MEDIGUIDE_EMBEDDING_MODEL", "models/gemini-embedding-001")
+LLM_TEMPERATURE = 0.2  # low = more faithful to the retrieved text
 
-# Retrieval settings
-TOP_K = 3
-MIN_SCORE = 0.03
+# ---- Chunking (two-stage ingestion) ---------------------------------------
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 100
 
-# Supported procedures (must match filenames in data/knowledge_base/*.md)
-PROCEDURE_DISPLAY_NAMES = {
-    "appendectomy": "Appendectomy",
-    "c_section": "C-Section",
-    "diabetes_hypertension": "Diabetes / Hypertension Management",
-}
+# ---- Retrieval -------------------------------------------------------------
+TOP_K = 4
+# Chunks scoring below this relevance are treated as "not in the knowledge
+# base". Tune it with eval/evaluate.py rather than guessing.
+MIN_RELEVANCE = float(os.getenv("MEDIGUIDE_MIN_RELEVANCE", "0.35"))
 
-SYSTEM_PROMPT = """You are MediGuide, a post-discharge patient care assistant.
+# Number of previous chat turns passed to the model for follow-up questions.
+HISTORY_TURNS = 4
 
-STRICT RULES:
-- Answer ONLY using the information in the provided CONTEXT below. Do not use outside medical knowledge.
-- If the context does not contain enough information to answer, say so explicitly instead of guessing.
-- Always mention which section your answer is grounded in (e.g. "Based on the Diet section...").
-- Keep answers short, warm, and easy to understand for a patient at home.
-- Never diagnose, assess symptoms, or comment on whether something is dangerous — that is handled separately.
-- If patient context (procedure, prescription, past questions) is provided, use it to personalize your answer where relevant.
-"""
+
+class ConfigError(RuntimeError):
+    """Raised when a required setting (such as the API key) is missing."""
+
+
+def require_api_key() -> str:
+    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise ConfigError(
+            "GOOGLE_API_KEY is not set. Get a free key at "
+            "https://aistudio.google.com/apikey and put it in a .env file "
+            "(see .env.example)."
+        )
+    # langchain-google-genai looks for GOOGLE_API_KEY specifically.
+    os.environ.setdefault("GOOGLE_API_KEY", key)
+    return key

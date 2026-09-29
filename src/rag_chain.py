@@ -1,135 +1,230 @@
 """
-RAG Chain (Orchestrator)
---------------------------
-Core of MediGuide. Flow for every patient question:
+rag_chain.py - the RAG pipeline, written with LangChain Expression Language
+(LCEL).
 
-  1. Safety check    -> refuse immediately if it's symptom-related
-  2. Retrieval        -> top-k relevant chunks for THIS procedure only
-  3. Patient context  -> pull in history + prescription for personalization
-  4. Generation       -> LLM answers ONLY from retrieved chunks, must cite
-  5. Log the turn     -> saved to patient history for future context
+Request flow for one patient question:
 
-Generation uses the Anthropic API (ANTHROPIC_API_KEY env var). Use
-use_llm=False to dry-run without an API key — useful for testing
-retrieval/safety in isolation.
+    question
+       |
+       v
+   [1] Safety layer (plain Python, src/safety.py)        -> refuse, or continue
+       |
+       v
+   [2] LCEL chain
+         retrieve  : vector search in ChromaDB, filtered to the patient's
+                     procedure (+ topics implied by their conditions),
+                     dropping chunks below a relevance threshold
+         branch    : nothing relevant found -> honest "not in my guide" reply
+                     (the LLM is NOT called, so it cannot invent an answer)
+         generate  : prompt | Gemini | string parser
+       |
+       v
+   Answer(text, sources)
+
+LCEL KEY IDEAS (useful for the viva):
+  * A "Runnable" is anything with .invoke(). Prompts, models, parsers,
+    lambdas and whole chains are all Runnables.
+  * The "|" operator pipes the output of one Runnable into the next:
+        prompt | llm | parser
+  * RunnablePassthrough.assign(x=...) keeps the incoming dict and adds a key.
+  * RunnableBranch picks a path based on a condition, like if/else.
+  * Because every step is a Runnable, the same chain can be invoked, batched
+    or streamed without code changes, and tests can swap in fake components.
 """
+from __future__ import annotations
 
-import os
-import re
-import pickle
+from dataclasses import dataclass, field
 
-from sklearn.metrics.pairwise import cosine_similarity
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableBranch, RunnableLambda, RunnablePassthrough
 
-from src import config, safety
-from src.text_utils import tokenize_and_stem, simple_stem  # noqa: F401 (tokenize_and_stem needed to unpickle vectorizer)
-from src.patient_history import PatientHistory
+from src.config import HISTORY_TURNS, LLM_MODEL, LLM_TEMPERATURE, MIN_RELEVANCE, TOP_K, require_api_key
+from src.patient import PatientProfile
+from src.prescriptions import medicines_context
+from src.procedures import PROCEDURES, label_for
+from src.safety import check_query
 
-_index_cache = None
+NO_CONTEXT_MSG = (
+    "I could not find this in the aftercare guide for your procedure, so I do not "
+    "want to guess. Please ask your doctor or care team, or try rephrasing your "
+    "question about diet, activity, wound care, daily routine or follow-up."
+)
+LLM_ERROR_MSG = (
+    "I could not reach the language model just now, so I cannot answer safely. "
+    "Please try again in a moment. If your question is urgent, contact your doctor."
+)
 
-# Stemming already unifies word FORMS ("shower"/"showers"). This map
-# handles genuine SYNONYMS, which stemming can't fix — a known,
-# documented limitation of lexical (TF-IDF) retrieval. A production
-# version would use sentence-transformers or an API embedding model.
-QUERY_SYNONYMS = {
-    "eat": ["food", "diet", "meal"],
-    "food": ["eat", "diet", "meal"],
-    "drink": ["fluid", "water", "hydration"],
-    "walk": ["activity", "exercise", "movement"],
-    "exercise": ["activity", "movement", "walk", "gym"],
-    "gym": ["exercise", "activity", "strenuous"],
-    "sleep": ["rest"],
-    "medicine": ["medication", "drug", "tablet", "dose"],
-    "medicin": ["medication", "drug", "tablet", "dose"],  # naive stemmer: "medicines" -> "medicin"
-    "wound": ["incision", "cut", "stitches"],
-    "shower": ["bath", "wash"],
-}
-_QUERY_SYNONYMS_BY_STEM = {simple_stem(k): v for k, v in QUERY_SYNONYMS.items()}
+SYSTEM_PROMPT = """You are MediGuide, a post-discharge aftercare assistant. You give general \
+lifestyle and logistics guidance (diet, activity, daily routine, wound care basics, follow-up \
+planning) to patients recovering at home.
 
+Rules you must always follow:
+1. Answer ONLY from the numbered guide excerpts provided. If they do not contain the answer, \
+say you do not have that information and suggest asking the doctor or care team. Never use \
+outside medical knowledge to fill gaps.
+2. Never diagnose, never interpret symptoms, never say whether something is normal or serious. \
+If the patient describes a symptom, tell them to contact their doctor.
+3. Never advise starting, stopping, skipping or changing a medicine or dose, and do not discuss \
+side effects or interactions; refer those to the doctor or pharmacist. You may read back what the \
+patient's uploaded prescription lists, and must say it was extracted automatically and may \
+contain errors.
+4. Use the patient background only to make general guidance fit them (for example, mention a \
+listed allergy or an existing condition where the excerpts allow it). Do not infer new medical \
+facts about the patient.
+5. If the excerpts conflict with the patient's own discharge instructions, tell them to follow \
+their doctor's instructions.
+6. Cite the excerpts you used like [S1], [S2] at the end of the relevant sentence.
+7. Be brief, calm and plain-spoken: short paragraphs or a short list. No emojis. Do not repeat \
+the disclaimer in every answer."""
 
-def _expand_query(query: str) -> str:
-    words = re.findall(r"[a-zA-Z]+", query.lower())
-    extra = []
-    for w in words:
-        extra.extend(_QUERY_SYNONYMS_BY_STEM.get(simple_stem(w), []))
-    return query + " " + " ".join(extra)
+HUMAN_PROMPT = """Primary procedure or condition: {primary_label}
 
-
-def _load_index():
-    global _index_cache
-    if _index_cache is None:
-        with open(config.INDEX_PATH, "rb") as f:
-            _index_cache = pickle.load(f)
-    return _index_cache
-
-
-def list_procedures():
-    idx = _load_index()
-    return sorted(set(c["procedure"] for c in idx["chunks"]))
-
-
-def retrieve(query: str, procedure: str, top_k: int = config.TOP_K, min_score: float = config.MIN_SCORE):
-    idx = _load_index()
-    vectorizer, matrix, chunks = idx["vectorizer"], idx["matrix"], idx["chunks"]
-
-    query_vec = vectorizer.transform([_expand_query(query)])
-    sims = cosine_similarity(query_vec, matrix)[0]
-
-    scored = [(sims[i], chunks[i]) for i in range(len(chunks)) if chunks[i]["procedure"] == procedure]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [(s, c) for s, c in scored[:top_k] if s >= min_score]
-
-
-def _build_prompt(query: str, retrieved_chunks, patient_context: str) -> str:
-    context_text = "\n\n".join(f"[Section: {c['section']}]\n{c['text']}" for _, c in retrieved_chunks)
-    return f"""PATIENT CONTEXT:
+Patient background:
 {patient_context}
 
-CONTEXT (from verified aftercare knowledge base):
-{context_text}
+Prescription information:
+{prescription_context}
 
-PATIENT QUESTION: {query}
+Guide excerpts:
+{context}
 
-Answer the patient's question using only the CONTEXT above, personalized using the PATIENT CONTEXT where relevant."""
-
-
-def _call_llm(prompt: str) -> str:
-    import anthropic
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-    response = client.messages.create(
-        model=config.LLM_MODEL,
-        max_tokens=config.LLM_MAX_TOKENS,
-        system=config.SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text
+Patient question: {question}"""
 
 
-def answer_query(patient_id: str, procedure: str, query: str, use_llm: bool = True):
-    history = PatientHistory(patient_id)
-    if history.data.get("procedure") != procedure:
-        history.set_procedure(procedure)
+@dataclass
+class Source:
+    label: str          # "S1"
+    procedure: str
+    section: str
+    snippet: str
+    score: float
 
-    # Step 1: Safety check
-    refuse, message = safety.check(query)
-    if refuse:
-        history.add_turn(query, message, refused=True)
-        return {"refused": True, "answer": message, "sources": []}
 
-    # Step 2: Retrieval (procedure-scoped)
-    retrieved = retrieve(query, procedure)
-    if not retrieved:
-        fallback = ("I don't have enough verified information to answer that "
-                     "confidently. Please check with your doctor or hospital.")
-        history.add_turn(query, fallback, refused=False)
-        return {"refused": False, "answer": fallback, "sources": []}
+@dataclass
+class Answer:
+    text: str
+    refused: bool = False
+    safety_level: str = "ok"
+    safety_reason: str = ""
+    sources: list = field(default_factory=list)
+    error: bool = False
 
-    # Step 3: Patient context (history + prescription) for personalization
-    patient_context = history.get_context_summary()
 
-    # Step 4: Generation
-    prompt = _build_prompt(query, retrieved, patient_context)
-    answer = _call_llm(prompt) if use_llm else "[DRY RUN — no LLM call made]\n\n" + prompt
+def format_docs(docs_with_scores) -> str:
+    """Number the retrieved chunks so the model can cite them as [S1], [S2]."""
+    blocks = []
+    for i, (doc, _score) in enumerate(docs_with_scores, start=1):
+        blocks.append(f"[S{i}] ({doc.metadata.get('title', '')} - {doc.metadata.get('section', '')})\n"
+                      f"{doc.page_content}")
+    return "\n\n".join(blocks)
 
-    sources = [c["section"] for _, c in retrieved]
-    history.add_turn(query, answer, refused=False)
-    return {"refused": False, "answer": answer, "sources": sources}
+
+def _to_messages(history) -> list:
+    """history: list of (role, text) with role in {'user', 'assistant'}."""
+    msgs = []
+    for role, text in history[-2 * HISTORY_TURNS:]:
+        msgs.append(HumanMessage(text) if role == "user" else AIMessage(text))
+    return msgs
+
+
+def get_llm():
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    require_api_key()
+    return ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, max_retries=2)
+
+
+class MediGuideAssistant:
+    """Ties together safety layer, retrieval and generation.
+
+    vectorstore and llm can be injected, which is how the tests run the whole
+    pipeline with fake components and no network.
+    """
+
+    def __init__(self, vectorstore=None, llm=None, k: int = TOP_K, min_relevance: float = MIN_RELEVANCE):
+        if vectorstore is None:
+            from src.ingest import get_vectorstore
+            vectorstore = get_vectorstore()
+        self.vectorstore = vectorstore
+        self.llm = llm if llm is not None else get_llm()
+        self.k = k
+        self.min_relevance = min_relevance
+        self.chain = self._build_chain()
+
+    # -- retrieval ----------------------------------------------------------
+    @staticmethod
+    def _search_filter(procedures: list[str]) -> dict:
+        # Only guidance chunks (never warning-sign chunks) from the patient's topics.
+        return {"$and": [{"kind": "guidance"}, {"procedure": {"$in": procedures}}]}
+
+    def _retrieve(self, inputs: dict) -> list:
+        """Return [(Document, score)] above the relevance threshold."""
+        query = f"{label_for(inputs['primary'])}: {inputs['question']}"
+        results = self.vectorstore.similarity_search_with_relevance_scores(
+            query, k=self.k, filter=self._search_filter(inputs["procedures"]))
+        return [(d, s) for d, s in results if s >= self.min_relevance]
+
+    # -- LCEL chain ---------------------------------------------------------
+    def _build_chain(self):
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT),
+            MessagesPlaceholder("history"),
+            ("human", HUMAN_PROMPT),
+        ])
+        generate = prompt | self.llm | StrOutputParser()
+
+        with_docs = RunnablePassthrough.assign(docs=RunnableLambda(self._retrieve))
+        with_context = RunnablePassthrough.assign(
+            context=RunnableLambda(lambda x: format_docs(x["docs"])))
+
+        answer_step = RunnableBranch(
+            # Condition 1: nothing relevant retrieved -> refuse to guess.
+            (lambda x: not x["docs"], RunnableLambda(lambda x: NO_CONTEXT_MSG)),
+            # Default: generate a grounded answer.
+            generate,
+        )
+        return with_docs | with_context | RunnablePassthrough.assign(answer=answer_step)
+
+    # -- public API ---------------------------------------------------------
+    def answer(self, question: str, procedure: str, profile: PatientProfile | None = None,
+               medicines: list | None = None, history: list | None = None) -> Answer:
+        if procedure not in PROCEDURES:
+            raise ValueError(f"Unknown procedure '{procedure}'")
+
+        # Step 1: safety layer. Blocked questions never reach retrieval or the LLM.
+        safety = check_query(question)
+        if safety.blocked:
+            return Answer(text=safety.message, refused=True,
+                          safety_level=safety.level, safety_reason=safety.reason)
+
+        profile = profile or PatientProfile(procedure_key=procedure)
+        # Personalised retrieval: add topics implied by the patient's conditions.
+        procedures = [procedure] + [p for p in profile.secondary_procedures() if p != procedure]
+
+        payload = {
+            "question": question,
+            "primary": procedure,
+            "primary_label": label_for(procedure),
+            "procedures": procedures,
+            "patient_context": profile.to_context(),
+            "prescription_context": medicines_context(medicines or []),
+            "history": _to_messages(history or []),
+        }
+        # Step 2: retrieval + generation.
+        try:
+            out = self.chain.invoke(payload)
+        except Exception:  # network, quota, model errors
+            return Answer(text=LLM_ERROR_MSG, error=True)
+
+        sources = [
+            Source(label=f"S{i}", procedure=d.metadata.get("procedure", ""),
+                   section=d.metadata.get("section", ""),
+                   snippet=d.page_content.split("\n", 1)[-1][:280], score=round(float(s), 3))
+            for i, (d, s) in enumerate(out["docs"], start=1)
+        ]
+        return Answer(text=out["answer"].strip(), sources=sources)
+
+
+def list_procedures() -> list[str]:
+    return list(PROCEDURES)

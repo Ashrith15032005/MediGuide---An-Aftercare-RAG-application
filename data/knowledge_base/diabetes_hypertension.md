@@ -1,24 +1,40 @@
-# Diabetes & Hypertension — Lifestyle Management Guide
+# Diabetes and Hypertension Management
 
-## Diet
-Favor whole grains (brown rice, millets/ragi, whole wheat) over refined carbs. Include plenty of vegetables, moderate fruit portions (avoid excess mango, banana, grapes if blood sugar is poorly controlled), and lean protein like dal, fish, or chicken. Limit salt intake to under 5g/day for blood pressure control — avoid pickles, papad, and processed/packaged foods high in sodium. Avoid sugary drinks, sweets, and fried snacks. Space meals evenly through the day rather than large infrequent meals.
+## Overview
+Diabetes and high blood pressure (hypertension) are long-term conditions managed mainly through daily habits, regular medicines and follow-up. Good control lowers the long-term risk of heart, kidney, eye and nerve problems. This guide covers lifestyle and routine only. Your target blood sugar, blood pressure and medicine plan are set by your own doctor, and those targets come first.
 
-## Activity and Movement
-Aim for at least 30 minutes of moderate activity (brisk walking, cycling) most days of the week, as approved by your doctor. Avoid sitting for long uninterrupted periods; take short movement breaks every hour. Monitor for signs of low blood sugar (dizziness, sweating, shakiness) during and after exercise if on insulin or sulfonylureas.
+## Diet for Diabetes
+Spread carbohydrates across the day instead of having large portions at once. Prefer whole grains, millets, oats, brown rice, whole wheat, lentils, beans and vegetables over white rice, white bread and sugary foods. Fill half your plate with non-starchy vegetables, a quarter with protein such as dal, eggs, fish, paneer or lean meat, and a quarter with grains. Choose whole fruit over fruit juice, and keep fruit portions moderate. Avoid sugary drinks, sweets, and refined snacks. Do not skip meals, especially if you take insulin or tablets that lower sugar, unless your doctor has said it is safe. A dietitian can build a plan around your usual foods.
 
-## Sleep
-Aim for 7-8 hours of consistent sleep, as poor sleep can worsen both blood sugar control and blood pressure. Avoid heavy meals or caffeine close to bedtime.
+## Diet for Hypertension
+Reduce salt: aim for less than about 5 grams of salt (one level teaspoon) per day from all sources. Limit pickles, papad, chips, instant noodles, packaged snacks, processed meats and salty sauces. Read food labels for sodium. Use herbs, lemon, garlic and spices for flavor instead of extra salt. Eat more fruit, vegetables, legumes and low-fat dairy. Foods rich in potassium such as bananas, oranges, potatoes and leafy greens can help, but people with kidney disease or on certain medicines should check with their doctor first. Limit alcohol and avoid smoking.
 
-## Medication
-Take medications at the same time each day as prescribed. Do not skip doses even if you feel fine — hypertension and diabetes often have no symptoms even when uncontrolled. Do not stop or adjust medication without consulting your doctor.
+## Physical Activity
+Aim for about 150 minutes of moderate activity per week, for example a brisk 30-minute walk on five days. Spread activity through the week. Short walks after meals help lower blood sugar. Add light strength exercises two days a week if your doctor agrees. Carry a source of fast sugar when exercising if you take insulin or sugar-lowering tablets. Start slowly if you have been inactive, and check with your doctor before starting a new exercise program.
 
-## Monitoring
-Check blood sugar and/or blood pressure as frequently as your doctor recommends and maintain a log. Regular follow-up visits (typically every 3 months) are important to adjust treatment.
+## Weight, Sleep and Stress
+Losing even 5 to 7 percent of body weight can improve both blood sugar and blood pressure. Aim for 7 to 8 hours of sleep. Stress can raise blood pressure and blood sugar, so build in time for relaxation such as deep breathing, walking or hobbies.
 
-## Red Flag Symptoms (require immediate doctor contact)
-- Blood sugar persistently above 300 mg/dL or below 70 mg/dL
-- Blood pressure above 180/120 mmHg
-- Severe headache, blurred vision, or chest pain
-- Confusion, fainting, or difficulty speaking
-- Non-healing wounds, especially on the feet
-- Shortness of breath or swelling in legs/ankles
+## Home Monitoring
+Check blood pressure at the same times each day, seated and rested for five minutes, with your arm supported at heart level and a validated upper-arm cuff. Write down each reading with the date and time. Check blood sugar as often as your doctor advised, and record it. Bring your log to every appointment. Do not change your medicine based on a single reading; discuss patterns with your doctor.
+
+## Foot, Eye and General Care
+If you have diabetes, look at your feet every day for cuts, blisters or color changes, wash and dry them well, and wear well-fitting footwear. Do not walk barefoot. Have a yearly dilated eye exam and regular kidney tests as advised. Keep your vaccinations up to date, including the annual flu vaccine, as your doctor recommends.
+
+## Sick Day and Travel Routine
+Keep your medicines in their original packaging and carry a list. When traveling, carry more medicine than you need and keep it in hand luggage. Ask your doctor for a written sick-day plan for days you are unwell or not eating normally.
+
+## Medicines
+Take medicines at the same time every day as prescribed. Use a pill organizer or phone reminders. Never stop or change a dose on your own, even when readings are good. Bring all your medicines to each visit. Questions about doses, side effects or interactions go to your doctor or pharmacist.
+
+## Follow-up
+Typical checks include blood pressure at every visit, HbA1c about every three to six months, and yearly kidney, eye, foot and cholesterol checks. Keep a list of questions for each visit.
+
+## Warning Signs
+- Blood sugar above 300 mg/dL or below 70 mg/dL, or a reading your doctor told you to report
+- Blood pressure of 180/120 or higher, or above the limit your doctor gave you
+- Chest pain, pressure or breathlessness (seek emergency care)
+- Sudden weakness, face drooping, trouble speaking or a sudden severe headache (seek emergency care)
+- Confusion, extreme thirst with frequent urination, or vomiting that prevents you from keeping fluids down
+- A foot wound or ulcer that is not healing, or new numbness or color change in a foot
+- Sudden vision changes
