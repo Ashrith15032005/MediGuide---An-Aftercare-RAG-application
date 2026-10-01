@@ -45,6 +45,12 @@ MIN_RELEVANCE = float(os.getenv("MEDIGUIDE_MIN_RELEVANCE", "0.35"))
 HISTORY_TURNS = 4
 
 
+# Name of the environment variable that holds the API key.
+# Exported so other modules (e.g. streamlit_app.py) can reference it without
+# hardcoding the string.
+GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
+
+
 class ConfigError(RuntimeError):
     """Raised when a required setting (such as the API key) is missing."""
 

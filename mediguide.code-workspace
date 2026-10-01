@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"name": "mediguide",
+			"path": "."
+		},
+		{
+			"name": "docs",
+			"path": "../../Desktop/mediguide/docs"
+		},
+		{
+			"name": "eval",
+			"path": "../../Desktop/mediguide/eval"
+		}
+	],
+	"settings": {}
+}
