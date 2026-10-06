@@ -29,6 +29,10 @@ COLLECTION_NAME = "mediguide_kb"
 # langchain-google-genai reads GOOGLE_API_KEY from the environment itself.
 LLM_MODEL = os.getenv("MEDIGUIDE_LLM_MODEL", "gemini-2.5-flash")
 EMBEDDING_MODEL = os.getenv("MEDIGUIDE_EMBEDDING_MODEL", "models/gemini-embedding-001")
+# Backup models tried in order if the main model is overloaded (503) or unavailable.
+# Comma-separated in .env: MEDIGUIDE_FALLBACK_MODELS=gemini-flash-latest,gemini-flash-lite-latest
+FALLBACK_MODELS = [m.strip() for m in os.getenv(
+    "MEDIGUIDE_FALLBACK_MODELS", "gemini-flash-latest,gemini-flash-lite-latest").split(",") if m.strip()]
 LLM_TEMPERATURE = 0.2  # low = more faithful to the retrieved text
 
 # ---- Chunking (two-stage ingestion) ---------------------------------------
@@ -43,12 +47,6 @@ MIN_RELEVANCE = float(os.getenv("MEDIGUIDE_MIN_RELEVANCE", "0.35"))
 
 # Number of previous chat turns passed to the model for follow-up questions.
 HISTORY_TURNS = 4
-
-
-# Name of the environment variable that holds the API key.
-# Exported so other modules (e.g. streamlit_app.py) can reference it without
-# hardcoding the string.
-GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
 
 
 class ConfigError(RuntimeError):

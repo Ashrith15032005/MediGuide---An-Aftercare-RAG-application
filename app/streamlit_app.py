@@ -1,390 +1,366 @@
 """
-MediGuide -- Streamlit Web Application
---------------------------------------
-Run from the project root with:
-    streamlit run app/streamlit_app.py
+MediGuide - Streamlit app.
 
-Flow:
-    1. Patient Intake: Health background (age, sex, conditions, allergies, BP, sugar, discharge date)
-       and procedure description/selection, plus prescription upload (image/PDF OCR).
-    2. Interactive Chat: Grounded aftercare assistant powered by LangChain LCEL & Gemini,
-       with deterministic rule-based safety screening.
+Run:  streamlit run app/streamlit_app.py
+
+Flow (four steps, tracked in st.session_state["stage"]):
+    1. intake        health background form
+    2. procedure     patient describes the procedure in their own words
+    3. prescriptions optional upload of one or more prescriptions (image/PDF)
+    4. chat          grounded Q&A with sources
+
+Streamlit reruns this whole script on every interaction; anything that must
+survive a rerun lives in st.session_state.
 """
-from __future__ import annotations
-
-import os
+import html
 import sys
+from datetime import date
 from pathlib import Path
 
-# Add project root to sys.path
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
 import streamlit as st
 
-from src.config import GOOGLE_API_KEY_ENV
+from src.config import ConfigError
+from src.knowledge_base import warning_signs
 from src.patient import PatientProfile, PatientStore
-from src.prescriptions import Medicine, read_prescription
-from src.procedures import PROCEDURES, label_for, match_procedure
-from src.rag_chain import MediGuideAssistant
+from src.prescriptions import PrescriptionError, read_prescription
+from src.procedures import GENERAL_KEY, SPECIFIC_KEYS, label_for, match_all
+from src.safety import check_query, check_vitals
 
-st.set_page_config(
-    page_title="MediGuide - Post-Discharge Care Assistant",
-    page_icon="🩺",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="MediGuide", page_icon=None, layout="wide")
 
-# Custom CSS for polished, accessible UI
+STEPS = ["Health background", "Your procedure", "Prescriptions", "Ask MediGuide"]
+STAGES = ["intake", "procedure", "prescriptions", "chat"]
+CONDITION_OPTIONS = ["Diabetes", "High blood pressure", "Heart disease", "Kidney disease",
+                     "Asthma or COPD", "Thyroid disorder", "None of these"]
+
 st.markdown(
     """
     <style>
-    .main-title {
-        font-size: 2.2rem;
-        font-weight: 700;
-        color: #1E3A8A;
-        margin-bottom: 0.2rem;
-    }
-    .subtitle {
-        font-size: 1.05rem;
-        color: #4B5563;
-        margin-bottom: 1.5rem;
-    }
-    .safety-card {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
-    }
-    .safety-emergency {
-        background-color: #FEE2E2;
-        border-left: 5px solid #DC2626;
-        color: #991B1B;
-    }
-    .safety-urgent {
-        background-color: #FEF3C7;
-        border-left: 5px solid #D97706;
-        color: #92400E;
-    }
-    .safety-refer {
-        background-color: #DBEAFE;
-        border-left: 5px solid #2563EB;
-        color: #1E40AF;
-    }
-    .source-badge {
-        display: inline-block;
-        background-color: #F3F4F6;
-        border: 1px solid #E5E7EB;
-        padding: 0.2rem 0.5rem;
-        border-radius: 0.25rem;
-        font-size: 0.8rem;
-        margin-right: 0.3rem;
-        margin-top: 0.3rem;
-    }
+    .block-container {padding-top: 2rem; max-width: 1100px;}
+    h1, h2, h3 {font-weight: 600; letter-spacing: -0.01em;}
+    .mg-sub {color: #5b6672; margin-top: -0.6rem; margin-bottom: 1.2rem;}
+    .mg-step {padding: 4px 0; color: #8a94a0;}
+    .mg-step-active {padding: 4px 0; font-weight: 600; color: #0f5c8c;}
+    .mg-note {border-left: 3px solid #0f5c8c; padding: 0.5rem 0.9rem; background: rgba(15,92,140,0.06);
+              border-radius: 2px; font-size: 0.92rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Initialize session state
-if "patient_id" not in st.session_state:
-    st.session_state.patient_id = "patient_demo"
-if "profile" not in st.session_state:
-    st.session_state.profile = PatientProfile(patient_id=st.session_state.patient_id)
-if "medicines" not in st.session_state:
-    st.session_state.medicines = []
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "intake_complete" not in st.session_state:
-    st.session_state.intake_complete = False
 
-patient_store = PatientStore()
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+def init_state() -> None:
+    defaults = {
+        "stage": "intake", "profile": PatientProfile(), "medicines": [],
+        "history": [], "messages": [], "seen_files": set(), "vitals_alerts": [],
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
 
-def load_assistant() -> MediGuideAssistant:
+def goto(stage: str) -> None:
+    st.session_state.stage = stage
+    st.rerun()
+
+
+def persist() -> None:
+    PatientStore().save(st.session_state.profile, st.session_state.medicines)
+
+
+@st.cache_resource(show_spinner="Loading the aftercare guide")
+def get_assistant():
+    from src.rag_chain import MediGuideAssistant
     return MediGuideAssistant()
 
 
-# -----------------------------------------------------------------------------
-# SIDEBAR
-# -----------------------------------------------------------------------------
-with st.sidebar:
-    st.header("🩺 Patient Dashboard")
-    st.caption(f"Session ID: `{st.session_state.patient_id}`")
+def show_vitals_alerts() -> None:
+    """Readings entered at intake that are outside a safe range stay visible."""
+    for level, message in st.session_state.vitals_alerts:
+        (st.error if level == "emergency" else st.warning)(message)
 
-    if st.session_state.intake_complete and st.session_state.profile.procedure_key:
-        proc_key = st.session_state.profile.procedure_key
-        st.success(f"**Procedure:** {label_for(proc_key)}")
 
-        with st.expander("👤 Health Background", expanded=False):
-            p = st.session_state.profile
-            if p.age:
-                st.write(f"- **Age:** {p.age}")
-            if p.sex:
-                st.write(f"- **Sex:** {p.sex}")
-            if p.conditions:
-                st.write(f"- **Conditions:** {', '.join(p.conditions)}")
-            if p.allergies:
-                st.write(f"- **Allergies:** {', '.join(p.allergies)}")
-            if p.bp_systolic and p.bp_diastolic:
-                st.write(f"- **BP:** {p.bp_systolic}/{p.bp_diastolic}")
-            if p.blood_sugar:
-                st.write(f"- **Blood Sugar:** {p.blood_sugar} mg/dL")
-            if p.days_since_discharge() is not None:
-                st.write(f"- **Days since discharge:** {p.days_since_discharge()}")
-
-        if st.session_state.medicines:
-            with st.expander(f"💊 Prescriptions ({len(st.session_state.medicines)})", expanded=False):
-                for m in st.session_state.medicines:
-                    med = m if isinstance(m, Medicine) else Medicine(**m)
-                    st.write(f"- **{med.name}** {med.dose} ({med.frequency})")
-
+def sidebar() -> None:
+    with st.sidebar:
+        st.markdown("### MediGuide")
+        st.caption("Post-discharge care assistant")
+        current = STAGES.index(st.session_state.stage)
+        for i, label in enumerate(STEPS):
+            cls = "mg-step-active" if i == current else "mg-step"
+            st.markdown(f"<div class='{cls}'>{i + 1}. {label}</div>", unsafe_allow_html=True)
+        profile: PatientProfile = st.session_state.profile
+        if profile.procedure_key:
+            st.divider()
+            st.markdown("**Procedure**")
+            st.write(label_for(profile.procedure_key))
+            with st.expander("Warning signs: contact your doctor"):
+                for sign in warning_signs(profile.procedure_key):
+                    st.markdown(f"- {sign}")
+                st.caption("If any of these is severe, or you are unsure, seek emergency care.")
+        if st.session_state.stage == "chat":
+            st.divider()
+            if st.button("Edit my details", width="stretch"):
+                goto("intake")
+        if st.button("Start over", width="stretch"):
+            for key in ("stage", "profile", "medicines", "history", "messages", "seen_files", "vitals_alerts"):
+                st.session_state.pop(key, None)
+            st.rerun()
         st.divider()
-        if st.button("✏️ Edit Intake & Prescriptions", use_container_width=True):
-            st.session_state.intake_complete = False
-            st.rerun()
-
-        if st.button("🗑️ Clear Chat History", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
-    else:
-        st.info("Complete the intake form to start tailored recovery chat.")
-
-    st.divider()
-    has_api_key = bool(os.environ.get(GOOGLE_API_KEY_ENV))
-    if has_api_key:
-        st.caption("✅ Google Gemini API key configured")
-    else:
-        st.caption("⚠️ `GOOGLE_API_KEY` or `GEMINI_API_KEY` missing. Please set it in your environment or .env file.")
+        st.caption("MediGuide gives general aftercare information only. It does not diagnose, "
+                   "treat or replace your doctor.")
 
 
-# -----------------------------------------------------------------------------
-# MAIN CONTENT
-# -----------------------------------------------------------------------------
-st.markdown('<div class="main-title">MediGuide</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Grounded post-discharge aftercare guidance. Not a substitute for emergency care or medical diagnosis.</div>',
-    unsafe_allow_html=True,
-)
-
-if not st.session_state.intake_complete:
-    # -------------------------------------------------------------------------
-    # STEP 1: PATIENT INTAKE FORM
-    # -------------------------------------------------------------------------
-    st.subheader("📋 Step 1: Health Background & Intake")
-    st.write(
-        "Please provide your procedure details and health background. MediGuide uses this context "
-        "to personalize recovery information (e.g. dietary precautions or exercise pace)."
-    )
-
-    with st.form("patient_intake_form"):
-        st.markdown("#### 1. Procedure Information")
-        proc_mode = st.radio(
-            "How would you like to specify your procedure?",
-            ["Choose from list", "Describe in your own words"],
-            horizontal=True,
-        )
-
-        procedure_key = ""
-        procedure_desc = ""
-        if proc_mode == "Choose from list":
-            proc_options = list(PROCEDURES.keys())
-            procedure_key = st.selectbox(
-                "Select procedure / condition:",
-                options=proc_options,
-                format_func=label_for,
-            )
-        else:
-            procedure_desc = st.text_input(
-                "Describe what procedure or surgery you had (e.g., 'had my appendix removed', 'c-section delivery'):",
-                value="",
-            )
-
-        st.markdown("#### 2. General Health Details")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            age_val = st.number_input("Age", min_value=0, max_value=120, value=st.session_state.profile.age or 0)
-        with c2:
-            sex_val = st.selectbox("Sex", ["", "Female", "Male", "Other"], index=0)
-        with c3:
-            discharge_date_val = st.date_input("Discharge Date (optional)", value=None)
-
+# ---------------------------------------------------------------------------
+# Step 1: intake
+# ---------------------------------------------------------------------------
+def intake_step() -> None:
+    st.header("Health background")
+    st.markdown("<div class='mg-sub'>This helps tailor general guidance. It stays on this computer.</div>",
+                unsafe_allow_html=True)
+    p: PatientProfile = st.session_state.profile
+    with st.form("intake"):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        name = c1.text_input("Full name", p.name)
+        age = c2.number_input("Age", 0, 120, p.age, step=1)
+        sex = c3.selectbox("Sex", ["", "Female", "Male", "Other"],
+                           index=["", "Female", "Male", "Other"].index(p.sex) if p.sex in ("", "Female", "Male", "Other") else 0)
+        preselected = [c for c in CONDITION_OPTIONS if c in p.conditions]
+        chosen = st.multiselect("Existing or past conditions", CONDITION_OPTIONS, default=preselected)
+        other = st.text_input("Other conditions (comma separated)",
+                              ", ".join(c for c in p.conditions if c not in CONDITION_OPTIONS))
         c4, c5 = st.columns(2)
-        with c4:
-            conditions_input = st.text_area(
-                "Existing conditions (comma-separated):",
-                value=", ".join(st.session_state.profile.conditions),
-                placeholder="e.g. Type 2 Diabetes, Hypertension, Asthma",
-            )
-        with c5:
-            allergies_input = st.text_area(
-                "Known allergies (comma-separated):",
-                value=", ".join(st.session_state.profile.allergies),
-                placeholder="e.g. Penicillin, Sulfa drugs, Peanuts",
-            )
+        allergies = c4.text_input("Allergies (comma separated)", ", ".join(p.allergies))
+        other_meds = c5.text_input("Other medicines you take", p.other_medications)
+        st.markdown("**Most recent readings, if you have them (leave 0 if not measured)**")
+        c6, c7, c8, c9 = st.columns(4)
+        sys_bp = c6.number_input("BP systolic", 0, 300, p.bp_systolic)
+        dia_bp = c7.number_input("BP diastolic", 0, 200, p.bp_diastolic)
+        sugar = c8.number_input("Blood sugar (mg/dL)", 0, 700, p.blood_sugar)
+        discharge = c9.date_input("Discharge date", value=date.fromisoformat(p.discharge_date) if p.discharge_date else None)
+        submitted = st.form_submit_button("Continue", type="primary")
 
-        c6, c7 = st.columns(2)
-        with c6:
-            bp_input = st.text_input("Recent Blood Pressure (e.g. 120/80):", placeholder="120/80")
-        with c7:
-            sugar_input = st.number_input("Recent Blood Sugar (mg/dL):", min_value=0, max_value=800, value=0)
-
-        st.markdown("#### 3. Prescriptions & Discharge Medications (Optional)")
-        uploaded_files = st.file_uploader(
-            "Upload photos or PDFs of your prescriptions:",
-            type=["png", "jpg", "jpeg", "pdf"],
-            accept_multiple_files=True,
-        )
-
-        submit_intake = st.form_submit_button("Continue to Recovery Assistant ➡️", use_container_width=True)
-
-    if submit_intake:
-        # Resolve procedure
-        final_proc_key = procedure_key
-        if proc_mode == "Describe in your own words" and procedure_desc:
-            match = match_procedure(procedure_desc)
-            if match:
-                final_proc_key = match.key
-                st.success(f"Matched procedure: **{label_for(final_proc_key)}**")
-            else:
-                st.error(
-                    f"Could not match '{procedure_desc}' to a supported procedure. "
-                    f"Supported topics: {', '.join(label_for(k) for k in PROCEDURES)}"
-                )
-                st.stop()
-
-        # Parse BP
-        bp_sys, bp_dia = 0, 0
-        if bp_input and "/" in bp_input:
-            try:
-                parts = bp_input.split("/")
-                bp_sys, bp_dia = int(parts[0].strip()), int(parts[1].strip())
-            except ValueError:
-                pass
-
-        # Update profile
-        prof = PatientProfile.from_lists(
-            conditions_text=conditions_input,
-            allergies_text=allergies_input,
-            patient_id=st.session_state.patient_id,
-            age=int(age_val),
-            sex=sex_val,
-            bp_systolic=bp_sys,
-            bp_diastolic=bp_dia,
-            blood_sugar=int(sugar_input),
-            discharge_date=discharge_date_val.isoformat() if discharge_date_val else "",
-            procedure_key=final_proc_key,
-            procedure_description=procedure_desc,
-        )
-        st.session_state.profile = prof
-
-        # Process prescriptions
-        parsed_medicines = []
-        if uploaded_files:
-            with st.spinner("Processing prescription files with OCR..."):
-                for uploaded in uploaded_files:
-                    try:
-                        _, meds = read_prescription(uploaded.getvalue(), uploaded.name)
-                        for m in meds:
-                            parsed_medicines.append(m.to_dict())
-                    except Exception as e:
-                        st.warning(f"Could not scan {uploaded.name}: {e}")
-
-        st.session_state.medicines = parsed_medicines
-        patient_store.save(prof, parsed_medicines)
-        st.session_state.intake_complete = True
+    if submitted:
+        if not name.strip():
+            st.error("Please enter your name.")
+            return
+        if bool(sys_bp) != bool(dia_bp):
+            st.error("Enter both systolic and diastolic blood pressure, or leave both as 0.")
+            return
+        if sys_bp and sys_bp <= dia_bp:
+            st.error("Systolic pressure should be higher than diastolic. Please re-check the values.")
+            return
+        conditions = [c for c in chosen if c != "None of these"] + [
+            c.strip() for c in other.split(",") if c.strip()]
+        new = PatientProfile.from_lists(
+            "", "", patient_id=p.patient_id, name=name.strip(), age=int(age), sex=sex,
+            other_medications=other_meds.strip(), bp_systolic=int(sys_bp), bp_diastolic=int(dia_bp),
+            blood_sugar=int(sugar), discharge_date=discharge.isoformat() if discharge else "",
+            procedure_key=p.procedure_key, procedure_description=p.procedure_description)
+        new.conditions = conditions
+        new.allergies = [a.strip() for a in allergies.split(",") if a.strip()]
+        st.session_state.profile = new
+        # Check the readings just entered; tell the patient right away if needed.
+        # Stored (not shown here) because st.rerun() below would wipe them.
+        st.session_state.vitals_alerts = [
+            (i.level, i.message) for i in check_vitals(new.bp_systolic, new.bp_diastolic, new.blood_sugar)]
+        persist()
+        st.session_state.stage = "procedure"
         st.rerun()
 
-else:
-    # -------------------------------------------------------------------------
-    # STEP 2: CHAT INTERFACE
-    # -------------------------------------------------------------------------
-    st.info(
-        f"**Active Procedure:** {label_for(st.session_state.profile.procedure_key)} | "
-        "Ask about diet, activity, recovery routine, wound care basics, or follow-up timelines."
-    )
 
-    # Display conversation messages
+# ---------------------------------------------------------------------------
+# Step 2: procedure in the patient's own words
+# ---------------------------------------------------------------------------
+def procedure_step() -> None:
+    st.header("Your procedure")
+    show_vitals_alerts()
+    st.markdown("<div class='mg-sub'>Describe what you had done, in your own words. Any surgery or "
+                "procedure is fine.</div>", unsafe_allow_html=True)
+    p: PatientProfile = st.session_state.profile
+    text = st.text_area("For example: I had my appendix taken out last week, or a C-section, or a knee "
+                        "replacement, or my gallbladder removed.",
+                        p.procedure_description, height=110)
+
+    # Not disabled when empty: a text area only commits on blur, so a disabled-until-filled
+    # button would swallow the first click.
+    if st.button("Continue with this description", type="primary"):
+        if not text.strip():
+            st.error("Please describe your surgery or procedure first.")
+            return
+        p.procedure_description = text.strip()
+        matches = [m for m in match_all(text) if m.key in SPECIFIC_KEYS]
+        top = [m for m in matches if matches and m.score == matches[0].score]
+        if len(top) == 1:
+            p.procedure_key = top[0].key
+            st.session_state.pop("procedure_choices", None)
+        elif len(top) > 1:
+            # Two guides fit equally well: let the patient pick between just those.
+            p.procedure_key = ""
+            st.session_state.procedure_choices = [m.key for m in top]
+        else:
+            # No specific guide: use the general recovery guide, with their own words as context.
+            p.procedure_key = GENERAL_KEY
+            st.session_state.pop("procedure_choices", None)
+
+    choices = st.session_state.get("procedure_choices")
+    if choices:
+        picked = st.radio("Your description fits more than one guide. Which is your main reason for care?",
+                          choices, index=None, format_func=label_for)
+        if picked:
+            p.procedure_key = picked
+            st.session_state.pop("procedure_choices", None)
+            st.rerun()
+    elif p.procedure_key == GENERAL_KEY:
+        st.info("I do not have a guide written specifically for this procedure, so I will use the general "
+                "recovery guide. It covers wound care, rest, diet, medicines and follow-up in general terms. "
+                "For anything specific to your operation (lifting limits, movement rules, timelines), "
+                "please follow your surgeon's instructions.")
+    elif p.procedure_key:
+        st.success(f"Matched: {label_for(p.procedure_key)}")
+
+    c1, c2 = st.columns([1, 6])
+    if c1.button("Back"):
+        goto("intake")
+    if c2.button("Continue", disabled=not p.procedure_key, type="primary"):
+        persist()
+        goto("prescriptions")
+
+
+# ---------------------------------------------------------------------------
+# Step 3: prescriptions
+# ---------------------------------------------------------------------------
+def prescriptions_step() -> None:
+    st.header("Prescriptions")
+    show_vitals_alerts()
+    st.markdown("<div class='mg-sub'>Optional. Upload one or more prescriptions (photo or PDF). "
+                "Medicines are used as reference only.</div>", unsafe_allow_html=True)
+    files = st.file_uploader("Upload prescriptions", type=["png", "jpg", "jpeg", "pdf"],
+                             accept_multiple_files=True)
+    for f in files or []:
+        marker = (f.name, f.size)
+        if marker in st.session_state.seen_files:
+            continue
+        try:
+            with st.spinner(f"Reading {f.name}"):
+                _, meds = read_prescription(f.getvalue(), f.name)
+        except PrescriptionError as exc:
+            st.error(f"{f.name}: {exc}")
+            continue
+        st.session_state.seen_files.add(marker)
+        if meds:
+            st.session_state.medicines.extend(m.to_dict() for m in meds)
+            st.success(f"{f.name}: found {len(meds)} medicine(s).")
+        else:
+            st.warning(f"{f.name}: no medicines could be recognised. Add them manually in the table below.")
+
+    st.markdown("**Medicines list**")
+    st.caption("Automatic reading can make mistakes. Check the table against your prescription, "
+               "correct it, or add rows.")
+    columns = ["name", "dose", "frequency", "duration", "instructions", "source"]
+    df = pd.DataFrame(st.session_state.medicines, columns=columns)
+    edited = st.data_editor(df, num_rows="dynamic", width="stretch", hide_index=True,
+                            column_config={"source": st.column_config.TextColumn(disabled=True)})
+    st.session_state.medicines = [
+        {k: ("" if pd.isna(v) else str(v)) for k, v in row.items()}
+        for row in edited.to_dict("records") if str(row.get("name") or "").strip()
+    ]
+
+    c1, c2 = st.columns([1, 6])
+    if c1.button("Back"):
+        goto("procedure")
+    if c2.button("Continue", type="primary"):
+        persist()
+        goto("chat")
+
+
+# ---------------------------------------------------------------------------
+# Step 4: chat
+# ---------------------------------------------------------------------------
+def render_answer_extras(msg: dict) -> None:
+    if msg.get("sources"):
+        with st.expander("Sources"):
+            for s in msg["sources"]:
+                st.markdown(f"**{s['label']}**  {label_for(s['procedure'])}, {s['section']}")
+                st.caption(s["snippet"])
+
+
+def chat_step() -> None:
+    p: PatientProfile = st.session_state.profile
+    st.header("Ask MediGuide")
+    show_vitals_alerts()
+    heading = (f"Recovery after: {p.procedure_description[:120]} (general guide)"
+               if p.procedure_key == GENERAL_KEY and p.procedure_description else label_for(p.procedure_key))
+    st.markdown(f"<div class='mg-sub'>{html.escape(heading)}</div>", unsafe_allow_html=True)
+    st.markdown("<div class='mg-note'>I can help with diet, activity, daily routine, wound care basics and "
+                "follow-up planning. For symptoms, medicine changes or anything worrying, contact your "
+                "doctor. In an emergency, call your local emergency number.</div>", unsafe_allow_html=True)
+    st.write("")
+
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("sources"):
-                with st.expander("📚 Verified Knowledge Base Sources", expanded=False):
-                    for s in msg["sources"]:
-                        st.markdown(
-                            f"- **{s.get('label', 'Source')}**: `{s.get('procedure', '')}` > `{s.get('section', '')}` "
-                            f"(relevance: {s.get('score', 0):.2f})\n"
-                            f"  > *\"{s.get('snippet', '')}\"*"
-                        )
+            st.write(msg["text"])
+            render_answer_extras(msg)
 
-    # Chat input
-    user_query = st.chat_input("Ask a question about your diet, wound care, activity, or follow-up...")
-    if user_query:
-        # Display user message
-        st.session_state.messages.append({"role": "user", "content": user_query})
-        with st.chat_message("user"):
-            st.markdown(user_query)
+    question = st.chat_input("Ask about your recovery")
+    if not question:
+        return
 
-        # Generate response
+    st.session_state.messages.append({"role": "user", "text": question})
+    with st.chat_message("user"):
+        st.write(question)
+    # Safety answers need no API key or vector store, so show them even if the
+    # assistant cannot start.
+    safety = check_query(question)
+    if safety.blocked:
         with st.chat_message("assistant"):
-            with st.spinner("Reviewing aftercare guidelines..."):
-                try:
-                    assistant = load_assistant()
-                    # Convert history
-                    hist = [
-                        (m["role"], m["content"])
-                        for m in st.session_state.messages[:-1]
-                        if m["role"] in ("user", "assistant")
-                    ]
-                    ans = assistant.answer(
-                        question=user_query,
-                        procedure=st.session_state.profile.procedure_key,
-                        profile=st.session_state.profile,
-                        medicines=st.session_state.medicines,
-                        history=hist,
-                    )
+            (st.error if safety.level == "emergency" else st.warning)(safety.message)
+        st.session_state.messages.append(
+            {"role": "assistant", "text": safety.message, "level": safety.level, "sources": []})
+        return
+    try:
+        assistant = get_assistant()
+    except ConfigError as exc:
+        st.error(str(exc))
+        return
+    except Exception as exc:
+        st.error(f"Could not start the assistant: {exc}. Have you run 'python -m src.ingest'?")
+        return
 
-                    if ans.refused:
-                        level_class = f"safety-{ans.safety_level}"
-                        st.markdown(
-                            f'<div class="safety-card {level_class}">'
-                            f'<strong>[{ans.safety_level.upper()}] Safety Guidance:</strong><br>{ans.text}</div>',
-                            unsafe_allow_html=True,
-                        )
-                        reply_text = ans.text
-                        sources_data = []
-                    elif ans.error:
-                        st.error(ans.text)
-                        reply_text = ans.text
-                        sources_data = []
-                    else:
-                        st.markdown(ans.text)
-                        sources_data = [
-                            {
-                                "label": s.label,
-                                "procedure": s.procedure,
-                                "section": s.section,
-                                "snippet": s.snippet,
-                                "score": s.score,
-                            }
-                            for s in ans.sources
-                        ]
-                        if sources_data:
-                            with st.expander("📚 Verified Knowledge Base Sources", expanded=False):
-                                for s in sources_data:
-                                    st.markdown(
-                                        f"- **{s['label']}**: `{s['procedure']}` > `{s['section']}` "
-                                        f"(relevance: {s['score']:.2f})\n"
-                                        f"  > *\"{s['snippet']}\"*"
-                                    )
-                        reply_text = ans.text
+    with st.chat_message("assistant"):
+        with st.spinner("Checking the guide"):
+            ans = assistant.answer(question, p.procedure_key, profile=p,
+                                   medicines=st.session_state.medicines,
+                                   history=st.session_state.history)
+        if ans.error:
+            st.error(ans.text)
+            with st.expander("Technical details (for the developer)"):
+                st.code(ans.error_detail or "no detail captured")
+                st.caption("Run 'python -m src.diagnose' in the project folder to test the API key, "
+                           "embedding model and language model one by one.")
+        elif ans.safety_level == "emergency":
+            st.error(ans.text)
+        elif ans.safety_level in ("urgent", "refer"):
+            st.warning(ans.text)
+        else:
+            st.write(ans.text)
+        msg = {"role": "assistant", "text": ans.text, "level": "error" if ans.error else ans.safety_level,
+               "sources": [s.__dict__ for s in ans.sources]}
+        render_answer_extras(msg)
+    st.session_state.messages.append(msg)
+    if not ans.refused and not ans.error:
+        st.session_state.history.extend([("user", question), ("assistant", ans.text)])
 
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": reply_text,
-                        "sources": sources_data,
-                    })
-                except Exception as ex:
-                    err_msg = f"An error occurred: {ex}"
-                    st.error(err_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": err_msg})
+
+def main() -> None:
+    init_state()
+    sidebar()
+    {"intake": intake_step, "procedure": procedure_step,
+     "prescriptions": prescriptions_step, "chat": chat_step}[st.session_state.stage]()
+
+
+main()

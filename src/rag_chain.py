@@ -33,6 +33,7 @@ LCEL KEY IDEAS (useful for the viva):
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -40,11 +41,13 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableBranch, RunnableLambda, RunnablePassthrough
 
-from src.config import HISTORY_TURNS, LLM_MODEL, LLM_TEMPERATURE, MIN_RELEVANCE, TOP_K, require_api_key
+from src.config import FALLBACK_MODELS, HISTORY_TURNS, LLM_MODEL, LLM_TEMPERATURE, MIN_RELEVANCE, TOP_K, require_api_key
 from src.patient import PatientProfile
 from src.prescriptions import medicines_context
-from src.procedures import PROCEDURES, label_for
+from src.procedures import GENERAL_KEY, PROCEDURES, label_for
 from src.safety import check_query
+
+log = logging.getLogger("mediguide")
 
 NO_CONTEXT_MSG = (
     "I could not find this in the aftercare guide for your procedure, so I do not "
@@ -76,7 +79,11 @@ facts about the patient.
 5. If the excerpts conflict with the patient's own discharge instructions, tell them to follow \
 their doctor's instructions.
 6. Cite the excerpts you used like [S1], [S2] at the end of the relevant sentence.
-7. Be brief, calm and plain-spoken: short paragraphs or a short list. No emojis. Do not repeat \
+7. If the primary procedure is the general recovery guide, the excerpts are NOT specific to the \
+patient's operation. Give only the general advice they contain, and for anything specific to the \
+named procedure (lifting limits, movement restrictions, dressings, timelines) say the guide does \
+not cover it and the surgeon must advise.
+8. Be brief, calm and plain-spoken: short paragraphs or a short list. No emojis. Do not repeat \
 the disclaimer in every answer."""
 
 HUMAN_PROMPT = """Primary procedure or condition: {primary_label}
@@ -110,6 +117,7 @@ class Answer:
     safety_reason: str = ""
     sources: list = field(default_factory=list)
     error: bool = False
+    error_detail: str = ""   # real exception (type + message) when error is True
 
 
 def format_docs(docs_with_scores) -> str:
@@ -130,9 +138,16 @@ def _to_messages(history) -> list:
 
 
 def get_llm():
+    """Main model with automatic retries, plus backup models for 503 'high demand' spikes."""
     from langchain_google_genai import ChatGoogleGenerativeAI
     require_api_key()
-    return ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, max_retries=2)
+
+    def make(name: str):
+        return ChatGoogleGenerativeAI(model=name, temperature=LLM_TEMPERATURE, max_retries=4)
+
+    main = make(LLM_MODEL)
+    backups = [make(m) for m in FALLBACK_MODELS if m != LLM_MODEL]
+    return main.with_fallbacks(backups) if backups else main
 
 
 class MediGuideAssistant:
@@ -151,6 +166,14 @@ class MediGuideAssistant:
         self.k = k
         self.min_relevance = min_relevance
         self.chain = self._build_chain()
+
+    @staticmethod
+    def _primary_label(procedure: str, profile: PatientProfile) -> str:
+        """For the general fallback guide, tell the model what the patient actually had."""
+        if procedure == GENERAL_KEY and profile.procedure_description.strip():
+            return (f"{label_for(procedure)}. The patient describes it as: "
+                    f"\"{profile.procedure_description.strip()[:200]}\"")
+        return label_for(procedure)
 
     # -- retrieval ----------------------------------------------------------
     @staticmethod
@@ -176,11 +199,13 @@ class MediGuideAssistant:
 
         with_docs = RunnablePassthrough.assign(docs=RunnableLambda(self._retrieve))
         with_context = RunnablePassthrough.assign(
-            context=RunnableLambda(lambda x: format_docs(x["docs"])))
+            context=RunnableLambda(lambda x: format_docs(x["docs"]) or "(no relevant guide excerpts found)"))
 
         answer_step = RunnableBranch(
             # Condition 1: nothing relevant retrieved -> refuse to guess.
-            (lambda x: not x["docs"], RunnableLambda(lambda x: NO_CONTEXT_MSG)),
+            # (If the patient uploaded a prescription, still call the model so it can read
+            # back what the prescription lists; the prompt forbids inventing anything else.)
+            (lambda x: not x["docs"] and not x["has_medicines"], RunnableLambda(lambda x: NO_CONTEXT_MSG)),
             # Default: generate a grounded answer.
             generate,
         )
@@ -205,17 +230,22 @@ class MediGuideAssistant:
         payload = {
             "question": question,
             "primary": procedure,
-            "primary_label": label_for(procedure),
+            "primary_label": self._primary_label(procedure, profile),
             "procedures": procedures,
             "patient_context": profile.to_context(),
             "prescription_context": medicines_context(medicines or []),
+            "has_medicines": bool(medicines),
             "history": _to_messages(history or []),
         }
         # Step 2: retrieval + generation.
         try:
             out = self.chain.invoke(payload)
-        except Exception:  # network, quota, model errors
-            return Answer(text=LLM_ERROR_MSG, error=True)
+        except Exception as exc:  # network, quota, bad key, model errors
+            # Keep the real cause: the patient sees a calm message, but the app and
+            # the terminal show what actually failed (bad key, quota, model name...).
+            log.exception("MediGuide pipeline failed")
+            return Answer(text=LLM_ERROR_MSG, error=True,
+                          error_detail=f"{type(exc).__name__}: {str(exc)[:400]}")
 
         sources = [
             Source(label=f"S{i}", procedure=d.metadata.get("procedure", ""),

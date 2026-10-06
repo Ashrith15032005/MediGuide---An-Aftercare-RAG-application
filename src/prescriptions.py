@@ -110,7 +110,8 @@ _LINE_START_RX = re.compile(rf"^\s*(?:\d+\s*[\.\)\-]\s*)?(?P<form>{_FORM})\b\.?\
 _DOSE_RX = re.compile(r"(\d+(?:\.\d+)?\s*(?:mg|mcg|µg|ug|gm|g|ml|iu|units?|%))\b", re.IGNORECASE)
 _FREQ_RX = re.compile(
     r"\b(od|bd|bid|tds|tid|qid|qds|hs|sos|prn|stat|once\s+(?:a\s+|per\s+)?daily|twice\s+(?:a\s+|per\s+)?daily|"
-    r"thrice\s+(?:a\s+|per\s+)?daily|every\s+\d+\s*(?:hours?|hrs?)|\d\s*-\s*\d\s*-\s*\d(?:\s*-\s*\d)?)\b",
+    r"thrice\s+(?:a\s+|per\s+)?daily|(?:one|two|three|four|\d)\s+times\s+(?:a\s+|per\s+)?(?:day|daily)|"
+    r"every\s+\d+(?:\s*[-\u2013]\s*\d+)?\s*(?:hours?|hrs?)|\d\s*-\s*\d\s*-\s*\d(?:\s*-\s*\d)?)\b",
     re.IGNORECASE,
 )
 _DURATION_RX = re.compile(r"(?:x|for)?\s*(\d+)\s*(days?|weeks?|months?|wks?)\b", re.IGNORECASE)
@@ -125,8 +126,63 @@ def _clean_name(raw: str) -> str:
     return re.sub(r"\s+", " ", name).title()
 
 
+_HEADER_WORDS = {
+    "name": ("medicine", "medicines", "drug", "medication", "name", "drug name", "medicine name"),
+    "dose": ("dose", "dosage", "strength"),
+    "frequency": ("frequency", "freq", "how often"),
+    "duration": ("duration", "days", "period"),
+    "instructions": ("instructions", "instruction", "remarks", "notes", "directions", "advice"),
+}
+
+
+def _header_field(line: str) -> str | None:
+    word = line.strip().strip(":").lower()
+    for field_name, words in _HEADER_WORDS.items():
+        if word in words:
+            return field_name
+    return None
+
+
+def _parse_table_cells(lines: list[str], source: str) -> list[Medicine]:
+    """Tables extracted from PDFs often come out one cell per line:
+
+        Medicine / Dose / Frequency / Duration / Instructions     (header cells)
+        Paracetamol / 500 mg / Every 6-8 hours / 5 days / After food   (one row)
+
+    Find a run of header cells, then read the following lines in groups of that size.
+    A row is accepted only if its dose cell looks like a dose, which also stops the
+    scan at footer lines such as 'Prescriber: ...'.
+    """
+    for start in range(len(lines)):
+        columns = []
+        i = start
+        while i < len(lines) and (f := _header_field(lines[i])) and f not in columns:
+            columns.append(f)
+            i += 1
+        if len(columns) < 3 or "name" not in columns or "dose" not in columns:
+            continue
+        medicines = []
+        width = len(columns)
+        while i + width <= len(lines):
+            row = dict(zip(columns, lines[i:i + width]))
+            if not _DOSE_RX.fullmatch(row["dose"].strip().replace("\u00a0", " ")) and not _DOSE_RX.search(row["dose"]):
+                break
+            medicines.append(Medicine(
+                name=_clean_name(row["name"]), dose=re.sub(r"\s+", "", row["dose"]),
+                frequency=row.get("frequency", ""), duration=row.get("duration", ""),
+                instructions=row.get("instructions", ""), source=source))
+            i += width
+        if medicines:
+            return medicines
+    return []
+
+
 def parse_medicines(text: str, source: str = "") -> list[Medicine]:
-    """Extract medicines from prescription text using line heuristics."""
+    """Extract medicines from prescription text (table cells first, then line heuristics)."""
+    cells = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    table = _parse_table_cells(cells, source)
+    if table:
+        return table
     medicines: list[Medicine] = []
     for line in text.splitlines():
         line = line.strip()

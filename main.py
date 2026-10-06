@@ -1,90 +1,127 @@
 """
-MediGuide CLI - test the assistant without the Streamlit UI.
+procedures.py - the registry of supported procedures/conditions, plus a
+matcher that turns a patient's own words into one of them.
 
-Examples (run one at a time):
-
-    python main.py --list
-    python main.py --describe "I had my appendix removed" --query "can I eat rice?"
-    python main.py --procedure c_section          # interactive chat
-    python main.py --procedure cardiac_recovery --patient asha --query "when can I drive?"
-
-If a profile was saved for --patient (by the Streamlit app), it is used for
-personalised answers.
+Why this exists: patients should be able to describe their procedure freely
+("I had my appendix taken out last week") instead of choosing from a
+dropdown. The matcher is deliberately simple and deterministic (phrase
+matching plus a light typo tolerance) so it is testable and needs no API
+call. Anything it cannot match is reported honestly as "not supported" rather
+than guessed.
 """
-import argparse
-import sys
+from __future__ import annotations
 
-from src.patient import PatientStore
-from src.procedures import PROCEDURES, label_for, match_procedure
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="MediGuide - post-discharge care assistant (CLI)")
-    p.add_argument("--list", action="store_true", help="list supported procedures and exit")
-    p.add_argument("--patient", default="demo_patient", help="patient/session id")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--procedure", choices=list(PROCEDURES), help="procedure key")
-    g.add_argument("--describe", help="describe the procedure in your own words")
-    p.add_argument("--query", help="ask one question; omit for interactive chat")
-    return p
+import difflib
+import re
+from dataclasses import dataclass
 
 
-def resolve_procedure(args, saved_profile):
-    if args.procedure:
-        return args.procedure
-    if args.describe:
-        match = match_procedure(args.describe)
-        if match is None:
-            sys.exit("Could not match that description to a supported procedure. "
-                     f"Supported: {', '.join(PROCEDURES)}")
-        return match.key
-    if saved_profile and saved_profile.procedure_key:
-        return saved_profile.procedure_key
-    sys.exit("Give --procedure or --describe (or save a profile in the app first).")
+@dataclass(frozen=True)
+class Procedure:
+    key: str          # used as metadata in the vector store
+    label: str        # shown to the patient
+    kb_file: str      # file inside data/knowledge_base/
+    aliases: tuple    # phrases patients might use
 
 
-def show(answer) -> None:
-    tag = f"[{answer.safety_level.upper()}] " if answer.refused else ""
-    print(f"\n{tag}{answer.text}\n")
-    for s in answer.sources:
-        print(f"  {s.label}: {s.procedure} > {s.section} (relevance {s.score})")
+PROCEDURES: dict[str, Procedure] = {
+    p.key: p
+    for p in (
+        Procedure(
+            "appendectomy", "Appendectomy (appendix removal)", "appendectomy.md",
+            ("appendectomy", "appendicectomy", "appendix", "appendix removal",
+             "appendix removed", "appendix surgery", "appendicitis",
+             "laparoscopic appendectomy"),
+        ),
+        Procedure(
+            "c_section", "C-section (caesarean delivery)", "c_section.md",
+            ("c section", "csection", "caesarean", "cesarean", "caesarean section",
+             "cesarean section", "caesarean delivery", "cesarean delivery", "lscs",
+             "lower segment caesarean", "surgical delivery", "baby by operation"),
+        ),
+        Procedure(
+            "diabetes_hypertension", "Diabetes and hypertension management",
+            "diabetes_hypertension.md",
+            ("diabetes", "diabetic", "type 2 diabetes", "type 1 diabetes", "sugar",
+             "blood sugar", "high sugar", "hypertension", "high blood pressure",
+             "high bp", "blood pressure", "bp", "hba1c", "insulin"),
+        ),
+        Procedure(
+            "cardiac_recovery", "Cardiac recovery (after a heart procedure or event)",
+            "cardiac_recovery.md",
+            ("cardiac", "heart attack", "myocardial infarction", "angioplasty", "stent",
+             "stenting", "bypass", "cabg", "heart surgery", "open heart",
+             "heart bypass", "coronary", "cardiac rehab", "heart operation"),
+        ),
+        # Fallback for any surgery/procedure without its own guide. No aliases on
+        # purpose: the matcher never picks it; the app assigns it when nothing else fits.
+        Procedure(
+            "general_recovery", "General recovery after surgery (procedure not covered by a specific guide)",
+            "general_recovery.md", (),
+        ),
+    )
+}
+
+# Key used when the patient's procedure is not one of the specific guides.
+GENERAL_KEY = "general_recovery"
+SPECIFIC_KEYS = tuple(k for k in PROCEDURES if k != GENERAL_KEY)
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    if args.list:
-        for key in PROCEDURES:
-            print(f"{key:24s} {label_for(key)}")
-        return
-
-    loaded = PatientStore().load(args.patient)
-    profile, medicines = loaded if loaded else (None, [])
-    procedure = resolve_procedure(args, profile)
-    print(f"Procedure: {label_for(procedure)}")
-
-    from src.rag_chain import MediGuideAssistant  # imported late so --list needs no key
-    assistant = MediGuideAssistant()
-    history: list = []
-
-    def ask(q: str) -> None:
-        ans = assistant.answer(q, procedure, profile=profile, medicines=medicines, history=history)
-        show(ans)
-        history.extend([("user", q), ("assistant", ans.text)])
-
-    if args.query:
-        ask(args.query)
-        return
-    print("Type a question, or 'quit' to exit. Not a substitute for medical advice.")
-    while True:
-        try:
-            q = input("\nyou> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if q.lower() in {"quit", "exit", "q"}:
-            break
-        if q:
-            ask(q)
+def list_procedures() -> list[str]:
+    return list(PROCEDURES)
 
 
-if __name__ == "__main__":
-    main()
+def label_for(key: str) -> str:
+    return PROCEDURES[key].label if key in PROCEDURES else key
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    key: str
+    score: int
+    matched: tuple
+
+
+_WORD_RX = re.compile(r"[a-z0-9]+")
+
+
+def _normalise(text: str) -> str:
+    # "c-section" and "C section" and "csection" should all look alike.
+    text = text.lower().replace("-", " ")
+    return " ".join(_WORD_RX.findall(text))
+
+
+def _score(text: str, tokens: list[str], proc: Procedure) -> MatchResult:
+    score, matched = 0, []
+    for alias in proc.aliases:
+        # Exact whole-phrase hit: longer phrases are stronger evidence.
+        if re.search(rf"\b{re.escape(alias)}\b", text):
+            score += 3 * len(alias.split())
+            matched.append(alias)
+            continue
+        # Typo tolerance for long single words only ("apendectomy").
+        if " " not in alias and len(alias) >= 7:
+            if difflib.get_close_matches(alias, tokens, n=1, cutoff=0.84):
+                score += 2
+                matched.append(alias + "~")
+    return MatchResult(proc.key, score, tuple(matched))
+
+
+def match_all(text: str, min_score: int = 3) -> list[MatchResult]:
+    """Every procedure that matches the text, best first."""
+    norm = _normalise(text)
+    tokens = norm.split()
+    results = [_score(norm, tokens, p) for p in PROCEDURES.values()]
+    return sorted((r for r in results if r.score >= min_score),
+                  key=lambda r: r.score, reverse=True)
+
+
+def match_procedure(text: str) -> MatchResult | None:
+    """Best single match, or None if nothing in the registry fits."""
+    results = match_all(text)
+    if not results:
+        return None
+    # A tie with no clear winner is ambiguous; let the UI ask the patient.
+    if len(results) > 1 and results[0].score == results[1].score:
+        return None
+    return results[0]

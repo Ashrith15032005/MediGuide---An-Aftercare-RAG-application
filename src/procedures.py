@@ -53,8 +53,18 @@ PROCEDURES: dict[str, Procedure] = {
              "stenting", "bypass", "cabg", "heart surgery", "open heart",
              "heart bypass", "coronary", "cardiac rehab", "heart operation"),
         ),
+        # Fallback for any surgery/procedure without its own guide. No aliases on
+        # purpose: the matcher never picks it; the app assigns it when nothing else fits.
+        Procedure(
+            "general_recovery", "General recovery after surgery",
+            "general_recovery.md", (),
+        ),
     )
 }
+
+# Key used when the patient's procedure is not one of the specific guides.
+GENERAL_KEY = "general_recovery"
+SPECIFIC_KEYS = tuple(k for k in PROCEDURES if k != GENERAL_KEY)
 
 
 def list_procedures() -> list[str]:
